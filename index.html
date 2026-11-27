@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="ms">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="SS Drive">
+<link rel="apple-touch-icon" href="icon.png">
+<title>SS Drive</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100vh;
+    font: 16px/1.4 -apple-system, system-ui, sans-serif;
+    background: #0e1116; color: #e8ebf0;
+    padding: calc(env(safe-area-inset-top) + 24px) 20px calc(env(safe-area-inset-bottom) + 24px);
+  }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  .sub { color: #8b93a1; font-size: 14px; margin: 0 0 24px; }
+  #paste {
+    width: 100%; height: 38vh; min-height: 220px;
+    border: 0; border-radius: 24px;
+    background: #2f6fed; color: #fff;
+    font-size: 26px; font-weight: 700;
+    -webkit-tap-highlight-color: transparent;
+  }
+  #paste:active { transform: scale(.98); background: #2a62d1; }
+  #paste:disabled { background: #3a4150; color: #aab1bd; }
+  #status { min-height: 24px; margin: 16px 0; text-align: center; font-weight: 600; }
+  .ok { color: #4ad18a; } .err { color: #ff6b6b; }
+  #preview { display: none; width: 100%; border-radius: 12px; margin-bottom: 16px; }
+  h2 { font-size: 15px; color: #8b93a1; margin: 24px 0 8px; }
+  ul { list-style: none; padding: 0; margin: 0; }
+  li { display: flex; justify-content: space-between; gap: 8px; padding: 10px 0; border-bottom: 1px solid #1f242d; font-size: 14px; }
+  li a { color: #7fb0ff; text-decoration: none; }
+  .setup { background: #2a1d1d; border-radius: 12px; padding: 14px; color: #ffb3b3; font-size: 14px; }
+</style>
+</head>
+<body>
+  <h1>SS Drive</h1>
+  <p class="sub">Screenshot → Done → <b>Copy and Delete</b> → tekan butang → <b>Paste</b></p>
+
+  <div id="setup" class="setup" hidden>Link belum setup. Buka app guna link penuh (yang ada <code>#u=...&amp;k=...</code>) dulu.</div>
+
+  <button id="paste">📋 Paste &amp; Upload</button>
+  <div id="status"></div>
+  <img id="preview" alt="">
+
+  <h2>Dah upload</h2>
+  <ul id="history"></ul>
+
+<script>
+  // Config comes from the link hash (#u=<apps script url>&k=<key>), saved to localStorage.
+  // Kept out of the page source so the public repo has no upload URL or key.
+  const params = new URLSearchParams(location.hash.slice(1));
+  if (params.get('u') && params.get('k')) {
+    localStorage.setItem('ssd_url', params.get('u'));
+    localStorage.setItem('ssd_key', params.get('k'));
+  }
+  const URL_ = localStorage.getItem('ssd_url');
+  const KEY = localStorage.getItem('ssd_key');
+
+  const btn = document.getElementById('paste');
+  const statusEl = document.getElementById('status');
+  const preview = document.getElementById('preview');
+  const historyEl = document.getElementById('history');
+
+  if (!URL_ || !KEY) { document.getElementById('setup').hidden = false; btn.disabled = true; }
+
+  function setStatus(msg, cls) { statusEl.textContent = msg; statusEl.className = cls || ''; }
+
+  function stamp() {
+    const d = new Date(), p = n => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())}_${p(d.getHours())}-${p(d.getMinutes())}-${p(d.getSeconds())}`;
+  }
+
+  function blobToBase64(blob) {
+    return new Promise((res, rej) => {
+      const r = new FileReader();
+      r.onload = () => res(r.result.split(',')[1]);
+      r.onerror = rej;
+      r.readAsDataURL(blob);
+    });
+  }
+
+  function loadHistory() { return JSON.parse(localStorage.getItem('ssd_hist') || '[]'); }
+  function renderHistory() {
+    historyEl.innerHTML = '';
+    for (const h of loadHistory()) {
+      const li = document.createElement('li');
+      const a = document.createElement('a');
+      a.href = h.url; a.textContent = '✅ ' + h.name; a.target = '_blank';
+      const t = document.createElement('span');
+      t.textContent = new Date(h.at).toLocaleTimeString('ms-MY', { hour: '2-digit', minute: '2-digit' });
+      li.append(a, t); historyEl.append(li);
+    }
+  }
+  function addHistory(item) {
+    const list = [item, ...loadHistory()].slice(0, 30);
+    localStorage.setItem('ssd_hist', JSON.stringify(list));
+    renderHistory();
+  }
+  renderHistory();
+
+  btn.addEventListener('click', async () => {
+    // clipboard.read() must be called directly inside the tap handler on iOS Safari.
+    let blob;
+    try {
+      const items = await navigator.clipboard.read();
+      for (const item of items) {
+        const type = item.types.find(t => t.startsWith('image/'));
+        if (type) { blob = await item.getType(type); break; }
+      }
+    } catch (e) {
+      return setStatus('Tak dapat baca clipboard: ' + e.message, 'err');
+    }
+    if (!blob) return setStatus('Clipboard takde gambar. Copy screenshot dulu.', 'err');
+
+    preview.src = URL.createObjectURL(blob);
+    preview.style.display = 'block';
+    btn.disabled = true;
+    setStatus('Uploading…');
+
+    try {
+      const ext = (blob.type.split('/')[1] || 'png').replace('jpeg', 'jpg');
+      const name = `${stamp()}.${ext}`;
+      // text/plain avoids a CORS preflight, which Apps Script does not answer.
+      const res = await fetch(URL_, {
+        method: 'POST',
+        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+        body: JSON.stringify({ key: KEY, name, mime: blob.type, data: await blobToBase64(blob) }),
+      });
+      const out = await res.json();
+      if (!out.ok) throw new Error(out.error);
+      addHistory({ name: out.name, url: out.url, at: Date.now() });
+      setStatus('✅ Dah masuk Drive: ' + out.name, 'ok');
+    } catch (e) {
+      setStatus('Upload gagal: ' + e.message, 'err');
+    } finally {
+      btn.disabled = false;
+    }
+  });
+</script>
+</body>
+</html>
