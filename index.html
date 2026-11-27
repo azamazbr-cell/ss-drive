@@ -36,6 +36,21 @@
   ul { list-style: none; padding: 0; margin: 0; }
   li { display: flex; justify-content: space-between; gap: 8px; padding: 10px 0; border-bottom: 1px solid #1f242d; font-size: 14px; }
   li a { color: #7fb0ff; text-decoration: none; }
+  #editor {
+    position: fixed; inset: 0; z-index: 10; background: #000;
+    display: flex; flex-direction: column;
+    padding: env(safe-area-inset-top) 0 env(safe-area-inset-bottom);
+  }
+  #editor[hidden] { display: none; }
+  #stage { flex: 1; min-height: 0; display: flex; align-items: center; justify-content: center; padding: 12px; }
+  #cv { touch-action: none; display: block; }
+  .bar { display: flex; gap: 8px; padding: 10px 12px 14px; }
+  .bar button {
+    flex: 1; height: 50px; border: 0; border-radius: 14px;
+    font-size: 16px; font-weight: 600; background: #232833; color: #e8ebf0;
+  }
+  .bar #ok { flex: 1.6; background: #2f6fed; color: #fff; }
+  .hint { color: #8b93a1; font-size: 13px; text-align: center; padding-top: 8px; }
   .setup { background: #2a1d1d; border-radius: 12px; padding: 14px; color: #ffb3b3; font-size: 14px; }
 </style>
 </head>
@@ -48,6 +63,17 @@
   <button id="paste">📋 Paste &amp; Upload</button>
   <div id="status"></div>
   <img id="preview" alt="">
+
+  <div id="editor" hidden>
+    <div class="hint">Tarik tepi / bucu untuk adjust · tarik tengah untuk alih</div>
+    <div id="stage"><canvas id="cv"></canvas></div>
+    <div class="bar">
+      <button id="cancel">Batal</button>
+      <button id="auto">Auto</button>
+      <button id="full">Penuh</button>
+      <button id="ok">✅ Upload</button>
+    </div>
+  </div>
 
   <h2>Dah upload</h2>
   <ul id="history"></ul>
@@ -119,11 +145,191 @@
     }
     if (!blob) return setStatus('Clipboard takde gambar. Copy screenshot dulu.', 'err');
 
-    preview.src = URL.createObjectURL(blob);
+    setStatus('');
+    openEditor(blob);
+  });
+
+  // ---------- Auto frame detection ----------
+  // The app's background colour is the most common colour on screen. A row is "busy" when
+  // over 75% of it is NOT background: text rows stay mostly background, photo/poster rows don't.
+  // The tallest run of busy rows (small gaps allowed) is taken as the image frame.
+  function busyRuns(flags, gapMax) {
+    let best = null, start = -1, lastBusy = -1;
+    for (let i = 0; i <= flags.length; i++) {
+      if (i < flags.length && flags[i]) {
+        if (start < 0 || i - lastBusy > gapMax) {
+          if (start >= 0 && (!best || lastBusy - start > best[1] - best[0])) best = [start, lastBusy];
+          start = i;
+        }
+        lastBusy = i;
+      }
+    }
+    if (start >= 0 && (!best || lastBusy - start > best[1] - best[0])) best = [start, lastBusy];
+    return best;
+  }
+
+  function bgColour(data) {
+    const hist = new Map(); let top = 0, best = 0;
+    for (let i = 0; i < data.length; i += 4) {
+      const k = (data[i] >> 4) << 8 | (data[i + 1] >> 4) << 4 | (data[i + 2] >> 4);
+      const n = (hist.get(k) || 0) + 1; hist.set(k, n);
+      if (n > top) { top = n; best = i; }
+    }
+    return [data[best], data[best + 1], data[best + 2]];
+  }
+
+  // Fraction of each row (or column) that is not background colour.
+  function fillFractions(data, bg, count, len, index) {
+    const out = new Array(count);
+    for (let a = 0; a < count; a++) {
+      let other = 0;
+      for (let b = 0; b < len; b++) {
+        const i = index(a, b) * 4;
+        if (Math.abs(data[i] - bg[0]) > 24 || Math.abs(data[i + 1] - bg[1]) > 24 || Math.abs(data[i + 2] - bg[2]) > 24) other++;
+      }
+      out[a] = other / len;
+    }
+    return out;
+  }
+
+  // Busy run, then trim its ends to rows that are almost fully filled (a real image edge),
+  // so dense text lines next to the image don't stretch the frame.
+  function frameRun(frac, gapMax) {
+    const run = busyRuns(frac.map(f => f > 0.75), gapMax);
+    if (!run) return null;
+    let [a, b] = run;
+    while (a < b && frac[a] < 0.95) a++;
+    while (b > a && frac[b] < 0.95) b--;
+    return a < b ? [a, b] : run;
+  }
+
+  function detectFrame(img) {
+    const iw = img.naturalWidth, ih = img.naturalHeight;
+    const W = 160, H = Math.round(ih * W / iw);
+    const c = document.createElement('canvas'); c.width = W; c.height = H;
+    const ctx = c.getContext('2d', { willReadFrequently: true });
+    ctx.drawImage(img, 0, 0, W, H);
+    const d = ctx.getImageData(0, 0, W, H).data;
+    const full = { x: 0, y: 0, w: iw, h: ih };
+
+    const bg = bgColour(d);
+    const rows = frameRun(fillFractions(d, bg, H, W, (y, x) => y * W + x), Math.round(H * 0.02));
+    if (!rows || rows[1] - rows[0] < H * 0.12) return full;
+    const rh = rows[1] - rows[0] + 1;
+    const cols = frameRun(fillFractions(d, bg, W, rh, (x, y) => (rows[0] + y) * W + x), Math.round(W * 0.02)) || [0, W - 1];
+
+    // Narrow poster: margins pull row fill below 95%, so trim rows again inside its columns only.
+    const cw = cols[1] - cols[0] + 1;
+    const inner = fillFractions(d, bg, H, cw, (y, x) => y * W + cols[0] + x);
+    while (rows[0] < rows[1] && inner[rows[0]] < 0.95) rows[0]++;
+    while (rows[1] > rows[0] && inner[rows[1]] < 0.95) rows[1]--;
+
+    const s = iw / W;
+    const x = Math.round(cols[0] * s), y = Math.round(rows[0] * s);
+    return { x, y, w: Math.min(iw - x, Math.round((cols[1] + 1) * s) - x), h: Math.min(ih - y, Math.round((rows[1] + 1) * s) - y) };
+  }
+
+  // ---------- Crop editor ----------
+  const editor = document.getElementById('editor');
+  const cv = document.getElementById('cv');
+  const cx = cv.getContext('2d');
+  let img = null, crop = null, scale = 1, drag = null;
+
+  function openEditor(blob) {
+    img = new Image();
+    img.onload = () => {
+      crop = detectFrame(img);
+      editor.hidden = false;
+      layout();
+    };
+    img.src = URL.createObjectURL(blob);
+  }
+
+  function layout() {
+    const box = document.getElementById('stage').getBoundingClientRect();
+    scale = Math.min(box.width / img.naturalWidth, box.height / img.naturalHeight);
+    const dpr = window.devicePixelRatio || 1;
+    cv.style.width = img.naturalWidth * scale + 'px';
+    cv.style.height = img.naturalHeight * scale + 'px';
+    cv.width = Math.round(img.naturalWidth * scale * dpr);
+    cv.height = Math.round(img.naturalHeight * scale * dpr);
+    cx.setTransform(scale * dpr, 0, 0, scale * dpr, 0, 0);
+    draw();
+  }
+  window.addEventListener('resize', () => { if (!editor.hidden) layout(); });
+
+  function draw() {
+    const iw = img.naturalWidth, ih = img.naturalHeight, { x, y, w, h } = crop;
+    cx.drawImage(img, 0, 0);
+    cx.fillStyle = 'rgba(0,0,0,.6)';
+    cx.fillRect(0, 0, iw, y); cx.fillRect(0, y + h, iw, ih - y - h);
+    cx.fillRect(0, y, x, h); cx.fillRect(x + w, y, iw - x - w, h);
+    const lw = 2 / scale, hs = 22 / scale;
+    cx.strokeStyle = '#fff'; cx.lineWidth = lw; cx.strokeRect(x, y, w, h);
+    cx.lineWidth = 5 / scale; cx.strokeStyle = '#2f6fed';
+    for (const [px, py, dx, dy] of [[x, y, 1, 1], [x + w, y, -1, 1], [x, y + h, 1, -1], [x + w, y + h, -1, -1]]) {
+      cx.beginPath(); cx.moveTo(px + dx * hs, py); cx.lineTo(px, py); cx.lineTo(px, py + dy * hs); cx.stroke();
+    }
+  }
+
+  function toImg(e) {
+    const r = cv.getBoundingClientRect();
+    return { x: (e.clientX - r.left) / scale, y: (e.clientY - r.top) / scale };
+  }
+
+  cv.addEventListener('pointerdown', e => {
+    const p = toImg(e), t = 28 / scale, { x, y, w, h } = crop;
+    const edges = {
+      l: Math.abs(p.x - x) < t, r: Math.abs(p.x - (x + w)) < t,
+      t: Math.abs(p.y - y) < t, b: Math.abs(p.y - (y + h)) < t,
+    };
+    const onEdge = edges.l || edges.r || edges.t || edges.b;
+    const inside = p.x > x && p.x < x + w && p.y > y && p.y < y + h;
+    if (!onEdge && !inside) return;
+    drag = { p, start: { ...crop }, edges, move: !onEdge };
+    cv.setPointerCapture(e.pointerId);
+  });
+
+  cv.addEventListener('pointermove', e => {
+    if (!drag) return;
+    const p = toImg(e), dx = p.x - drag.p.x, dy = p.y - drag.p.y, s = drag.start;
+    const iw = img.naturalWidth, ih = img.naturalHeight, min = 40;
+    if (drag.move) {
+      crop.x = Math.max(0, Math.min(iw - s.w, s.x + dx));
+      crop.y = Math.max(0, Math.min(ih - s.h, s.y + dy));
+    } else {
+      let l = s.x, t = s.y, r = s.x + s.w, b = s.y + s.h;
+      if (drag.edges.l) l = Math.max(0, Math.min(r - min, l + dx));
+      if (drag.edges.r) r = Math.min(iw, Math.max(l + min, r + dx));
+      if (drag.edges.t) t = Math.max(0, Math.min(b - min, t + dy));
+      if (drag.edges.b) b = Math.min(ih, Math.max(t + min, b + dy));
+      crop = { x: l, y: t, w: r - l, h: b - t };
+    }
+    draw();
+  });
+  cv.addEventListener('pointerup', () => { drag = null; });
+  cv.addEventListener('pointercancel', () => { drag = null; });
+
+  function closeEditor() { editor.hidden = true; URL.revokeObjectURL(img.src); }
+
+  document.getElementById('cancel').onclick = () => { closeEditor(); setStatus('Batal.'); };
+  document.getElementById('full').onclick = () => { crop = { x: 0, y: 0, w: img.naturalWidth, h: img.naturalHeight }; draw(); };
+  document.getElementById('auto').onclick = () => { crop = detectFrame(img); draw(); };
+  document.getElementById('ok').onclick = () => {
+    const out = document.createElement('canvas');
+    const { x, y, w, h } = crop;
+    out.width = Math.round(w); out.height = Math.round(h);
+    out.getContext('2d').drawImage(img, Math.round(x), Math.round(y), out.width, out.height, 0, 0, out.width, out.height);
+    preview.src = out.toDataURL('image/png');
     preview.style.display = 'block';
+    closeEditor();
+    out.toBlob(upload, 'image/png');
+  };
+
+  // ---------- Upload ----------
+  async function upload(blob) {
     btn.disabled = true;
     setStatus('Uploading…');
-
     try {
       const ext = (blob.type.split('/')[1] || 'png').replace('jpeg', 'jpg');
       const name = `${stamp()}.${ext}`;
@@ -142,7 +348,7 @@
     } finally {
       btn.disabled = false;
     }
-  });
+  }
 </script>
 </body>
 </html>
